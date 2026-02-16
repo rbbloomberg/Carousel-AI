@@ -30,7 +30,6 @@ def run_campaign_pipeline(self, brief_id: str):
     logger.info(f"Starting campaign pipeline for brief {brief_id}")
 
     async def _execute():
-        # Import here to avoid circular imports at module level
         from sqlalchemy import select
         from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
         from app.config import settings
@@ -38,6 +37,7 @@ def run_campaign_pipeline(self, brief_id: str):
         from app.models.campaign import Campaign
         from app.models.task import AgentTask
         from app.agents.workflows.brief_to_campaign import campaign_graph
+        from app.services.events import event_publisher, EventType
 
         engine = create_async_engine(settings.database_url)
         session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -78,6 +78,12 @@ def run_campaign_pipeline(self, brief_id: str):
             db.add(task_record)
             await db.commit()
 
+            # Publish pipeline started event
+            await event_publisher.publish(
+                campaign_id, EventType.PIPELINE_STARTED,
+                data={"brief_title": brief.title, "brief_id": brief_id},
+            )
+
             # Build state and run the LangGraph pipeline
             initial_state = {
                 "brief": {
@@ -92,6 +98,7 @@ def run_campaign_pipeline(self, brief_id: str):
                 },
                 "brand_guidelines": {},  # TODO: load from client
                 "campaign_id": campaign_id,
+                "stages_completed": [],
             }
 
             try:
@@ -108,24 +115,40 @@ def run_campaign_pipeline(self, brief_id: str):
                 }
                 campaign.status = "approval"
 
-                # Mark task complete
                 task_record.status = "completed"
-                task_record.output_data = {"final_stage": final_state.get("current_stage")}
+                task_record.output_data = {
+                    "final_stage": final_state.get("current_stage"),
+                    "stages_completed": final_state.get("stages_completed", []),
+                }
                 task_record.completed_at = datetime.now(timezone.utc)
 
-                # Mark brief as completed
                 brief.status = "completed"
-
                 await db.commit()
+
+                await event_publisher.publish(
+                    campaign_id, EventType.PIPELINE_COMPLETED,
+                    progress=100,
+                    data={"campaign_id": campaign_id},
+                )
+                await event_publisher.publish(
+                    campaign_id, EventType.APPROVAL_REQUESTED,
+                    data={"message": "Campaign ready for your review and approval"},
+                )
+
                 logger.info(f"Campaign pipeline completed for {campaign_id}")
 
             except Exception as e:
                 logger.error(f"Pipeline failed for brief {brief_id}: {e}")
-                campaign.status = "planning"  # Reset to allow retry
+                campaign.status = "planning"
                 task_record.status = "failed"
                 task_record.error = str(e)
                 task_record.completed_at = datetime.now(timezone.utc)
                 await db.commit()
+
+                await event_publisher.publish(
+                    campaign_id, EventType.PIPELINE_FAILED,
+                    data={"error": str(e)},
+                )
                 raise
 
         await engine.dispose()
@@ -143,28 +166,47 @@ def launch_campaign(self, campaign_id: str):
         from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
         from app.config import settings
         from app.models.campaign import Campaign
+        from app.models.brief import Brief
         from app.integrations.meta_ads import meta_ads_client
+        from app.services.events import event_publisher, EventType
 
         engine = create_async_engine(settings.database_url)
         session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
         async with session_factory() as db:
-            result = await db.execute(select(Campaign).where(Campaign.id == uuid.UUID(campaign_id)))
+            result = await db.execute(
+                select(Campaign).where(Campaign.id == uuid.UUID(campaign_id))
+            )
             campaign = result.scalar_one_or_none()
             if not campaign:
                 raise ValueError(f"Campaign {campaign_id} not found")
+
+            # Load brief for budget info
+            brief_result = await db.execute(
+                select(Brief).where(Brief.id == campaign.brief_id)
+            )
+            brief = brief_result.scalar_one_or_none()
+
+            daily_budget = 1000  # cents, default
+            if brief and brief.budget_duration_days > 0:
+                daily_budget = int(brief.budget_total / brief.budget_duration_days * 100)
 
             # Create campaign on Meta
             meta_result = await meta_ads_client.create_campaign(
                 ad_account_id="placeholder",
                 name=campaign.name,
-                daily_budget=int(campaign.brief.budget_total / campaign.brief.budget_duration_days * 100) if campaign.brief else 1000,
+                daily_budget=daily_budget,
             )
 
             campaign.platform_data = {"meta": meta_result}
             campaign.status = "live"
             campaign.launched_at = datetime.now(timezone.utc)
             await db.commit()
+
+            await event_publisher.publish(
+                campaign_id, EventType.CAMPAIGN_LAUNCHED,
+                data={"platform": "meta", "meta_campaign_id": meta_result.get("id")},
+            )
 
             logger.info(f"Campaign {campaign_id} launched on Meta: {meta_result}")
 
